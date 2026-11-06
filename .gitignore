@@ -1,14 +1,21 @@
-# 编译产物
-openwrt/
-bin/
-dl/
-build_dir/
-staging_dir/
-tmp/
+# OpenWrt 编译产物（只匹配仓库根目录，避免误伤 files/ 覆盖层）
+# 注意：写 `bin/` 会匹配任意层级的 bin 目录，把 files/usr/bin/ 也忽略掉，
+# 之前就是这样导致 files/usr/bin/hk09-wifiguard 提交不进去。
+/openwrt/
+/bin/
+/dl/
+/build_dir/
+/staging_dir/
+/tmp/
+
+# 编译中间产物（这些按扩展名匹配没问题）
 *.o
 *.ko
+*.a
+*.so
 
 # 编辑器/系统
 .DS_Store
 Thumbs.db
 *.swp
+*~

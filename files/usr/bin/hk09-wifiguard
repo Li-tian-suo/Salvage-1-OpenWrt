@@ -1,0 +1,90 @@
+#!/bin/sh
+# /usr/bin/hk09-wifiguard —— 无线接口看门狗
+#
+# 背景（板子实测）：
+#   跑 homebox 测速把带宽打满之后，Wi-Fi 会整体消失：
+#     - 系统存活：ping 192.168.1.1 / :80 / :22 / :3300 全通
+#     - `iw dev` 输出为空，Windows 扫不到任何 SSID
+#     - dmesg 里 agg 计数不再增长，也没有明显的 ath11k 报错
+#   重启之后立刻恢复，说明是 ath11k / NSS 数据面在高吞吐下退化。
+#   这种状态**不会自愈**，只能重新初始化无线。
+#
+# 本脚本策略（由轻到重，逐级升级）：
+#   级别 1：`wifi reload`            —— 重新下发配置，不重载驱动
+#   级别 2：`wifi down; wifi up`     —— 关掉再起来，会短暂断开客户端
+#   级别 3：只记日志，不再尝试        —— 连续失败太多次说明不是软件状态问题
+#
+# 恢复成功后计数清零。
+
+INTERVAL=${WIFIGUARD_INTERVAL:-20}     # 检查周期（秒）
+EXPECT_PHY=${WIFIGUARD_EXPECT_PHY:-2}  # 本板有 2 个 phy（2.4G + 5G）
+MAX_HARD=${WIFIGUARD_MAX_HARD:-3}      # 最多做几次"重"恢复
+
+log() {
+	logger -t hk09-wifiguard "$*"
+}
+
+# 返回当前 _ap_ 接口数量
+count_ap_ifaces() {
+	iw dev 2>/dev/null | grep -c 'Interface'
+}
+
+do_reload() {
+	log "级别1：wifi reload"
+	wifi reload >/dev/null 2>&1
+	sleep 12
+}
+
+do_cycle() {
+	log "级别2：wifi down / wifi up"
+	wifi down >/dev/null 2>&1
+	sleep 3
+	wifi up >/dev/null 2>&1
+	sleep 20
+}
+
+log "启动，周期 ${INTERVAL}s，期望接口数 ${EXPECT_PHY}，最多重试 ${MAX_HARD} 次"
+
+hard_fails=0
+while :; do
+	sleep "$INTERVAL"
+
+	n=$(count_ap_ifaces)
+
+	if [ "$n" -ge "$EXPECT_PHY" ]; then
+		# 正常。如果之前经历过故障，记一条恢复日志
+		if [ "$hard_fails" -gt 0 ]; then
+			log "已恢复（接口数 $n），重置计数"
+			hard_fails=0
+		fi
+		continue
+	fi
+
+	log "异常：接口数 $n < $EXPECT_PHY"
+
+	if [ "$hard_fails" -ge "$MAX_HARD" ]; then
+		log "已达重试上限（$MAX_HARD），停止尝试。请手动 reboot 或检查 dmesg"
+		# 不再刷屏：等到恢复正常或人为重启
+		sleep 300
+		continue
+	fi
+
+	do_reload
+	n=$(count_ap_ifaces)
+	if [ "$n" -ge "$EXPECT_PHY" ]; then
+		log "wifi reload 后恢复（接口数 $n）"
+		hard_fails=0
+		continue
+	fi
+
+	do_cycle
+	n=$(count_ap_ifaces)
+	if [ "$n" -ge "$EXPECT_PHY" ]; then
+		log "wifi down/up 后恢复（接口数 $n）"
+		hard_fails=0
+		continue
+	fi
+
+	hard_fails=$((hard_fails + 1))
+	log "恢复失败（第 $hard_fails 次），$( [ "$hard_fails" -lt "$MAX_HARD" ] && echo '稍后重试' || echo '已达上限' )"
+done
