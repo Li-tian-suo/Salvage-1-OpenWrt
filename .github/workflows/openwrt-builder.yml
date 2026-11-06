@@ -38,6 +38,19 @@ on:
     paths-ignore:
       - '**.md'
 
+# 同一个并发组里只保留一个 run。
+#
+# 为什么需要这个：本 workflow 同时被 push 和 workflow_dispatch 触发，
+# push 完再手动 dispatch 就会产生两个 run 同时编译，白占两个 runner
+# （一次约 50 分钟）。实测还遇到过更糟的情况：手动取消其中 queued 的那个，
+# 结果把整个并发组都取消了，连正在跑的也挂掉。
+#
+# cancel-in-progress: false —— 不取消正在跑的（编译到一半被砍很浪费），
+# 只让新的排队等待。想立刻跑新的就自己取消旧的。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   # 上游源码树（ccmx200 的 fork，NSS vendor 分支）
   REPO_URL: https://github.com/ccmx200/openwrt-salvage-1-code
@@ -50,10 +63,6 @@ env:
 
 permissions:
   contents: write
-
-concurrency:
-  group: hk09-build-${{ github.ref }}
-  cancel-in-progress: true
 
 jobs:
   build:
