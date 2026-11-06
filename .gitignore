@@ -5,6 +5,8 @@ dl/
 build_dir/
 staging_dir/
 tmp/
+*.o
+*.ko
 
 # 编辑器/系统
 .DS_Store

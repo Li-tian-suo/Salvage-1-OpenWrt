@@ -83,6 +83,50 @@ die() { printf '\033[1;31m[hk09] ERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 log "项目根 = ${SRC}"
 [ -d target/linux/qualcommax ] || die "当前目录不是 openwrt 源码树根（缺 target/linux/qualcommax）"
 
+# ---------------------------------------------------------------- 0. caldata 补丁
+# 关键：base-files 里的 11-ath11k-caldata 是按 board_name 分支的。
+#
+# 上游只有 cuicanmx,salvage-1 这一个分支，我们的 board_name 是 hk09,hk09，
+# 匹配不上 → 整个 case 落到 *)
+#   → 不生成 /lib/firmware/ath11k/IPQ8074/hw2.0/cal-ahb-c000000.wifi.bin
+#   → ath11k 报 "qmi failed to load CAL data file"
+#   → Wi-Fi 两个频段全都起不来，但以太网正常，很容易误判成"Wi-Fi 坏了"
+#
+# 实测日志（板子上刷了我们编的固件之后）：
+#   ath11k c000000.wifi: qmi failed to load CAL data file:cal-ahb-c000000.wifi.bin
+#   ath11k c000000.wifi: failed to load board data file: -12
+#   /lib/firmware/ath11k/IPQ8074/hw2.0/ 里只有 board-2.bin，没有 cal-*.bin
+#
+# 修法：把 hk09,hk09 加到 cuicanmx,salvage-1 那个分支里（两者是同一块硬件，
+# ART 里的校准数据布局完全一样，实测 ART[0x1000] md5 702471f9...）。
+CALDATA="target/linux/qualcommax/ipq807x/base-files/etc/hotplug.d/firmware/11-ath11k-caldata"
+if [ -f "$CALDATA" ]; then
+	if grep -q 'hk09,hk09' "$CALDATA"; then
+		log "caldata 脚本已含 hk09,hk09，跳过"
+	else
+		# 把单行 "cuicanmx,salvage-1)" 改成 "cuicanmx,salvage-1|\hk09,hk09)"
+		# 注意：sed 里 | 在 BRE 不特殊，但要写入的是字面反斜杠+换行，用 awk 更稳
+		awk '
+			/^[[:space:]]*cuicanmx,salvage-1\)/ {
+				print "\tcuicanmx,salvage-1|\\"
+				print "\thk09,hk09)"
+				next
+			}
+			{ print }
+		' "$CALDATA" > "${CALDATA}.new"
+		if grep -q 'hk09,hk09' "${CALDATA}.new"; then
+			mv "${CALDATA}.new" "$CALDATA"
+			log "已给 caldata 脚本加上 hk09,hk09 分支"
+			grep -n -A1 'cuicanmx,salvage-1' "$CALDATA" | sed 's/^/    /'
+		else
+			rm -f "${CALDATA}.new"
+			die "caldata 补丁失败：没能在 ${CALDATA} 里找到 cuicanmx,salvage-1 分支"
+		fi
+	fi
+else
+	log "注意：源码树里没有 ${CALDATA}（上游可能改了结构），跳过"
+fi
+
 # ---------------------------------------------------------------- 1. 放 DTS
 # 两种目录布局都要兼容：
 #   ccmx200 fork (LiBwrt 24.x/25.x) : files/arch/arm64/boot/dts/qcom/

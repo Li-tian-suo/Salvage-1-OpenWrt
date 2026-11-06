@@ -290,10 +290,25 @@
 	/* 按键与 LED 的 GPIO 全部来自实机设备树（见顶层 gpio_keys / leds 注释） */
 	button_pins: button_pins {
 		wps_button {
-			pins = "gpio12";
+			/*
+			 * 必须是 gpio34，不是 gpio12。
+			 *
+			 * 实机日志抓到的冲突：
+			 *   ipq8074-pinctrl 1000000.pinctrl: pin GPIO_12 already
+			 *     requested by 79b0000.nand-controller; cannot claim for gpio_keys
+			 *   gpio-keys gpio_keys: Error applying setting, reverse things back
+			 *
+			 * GPIO 12 是 NAND 控制器的（79b0000.nand-controller），
+			 * 被 pinctrl 先占了，按键再申请就 -EINVAL，
+			 * 整个 gpio-keys 设备初始化失败 —— 按键完全不可用。
+			 *
+			 * 根因是早期把 phandle 0x0c 误读成 GPIO 12（上面的注释已改正），
+			 * 但这份 pinctrl 没跟着改。gpio_keys 节点里写的是 GPIO 34。
+			 */
+			pins = "gpio34";
 			function = "gpio";
 			drive-strength = <8>;
-			bias-pull-down;
+			bias-pull-up;
 		};
 	};
 
