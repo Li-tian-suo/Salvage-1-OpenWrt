@@ -1,0 +1,12 @@
+# 编译产物
+openwrt/
+bin/
+dl/
+build_dir/
+staging_dir/
+tmp/
+
+# 编辑器/系统
+.DS_Store
+Thumbs.db
+*.swp

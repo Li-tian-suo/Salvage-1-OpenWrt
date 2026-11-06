@@ -1,0 +1,47 @@
+#!/bin/sh
+#
+# HK09 Wi-Fi 默认值固化（uci-defaults，只在首次启动/恢复出厂后执行）
+#
+# 为什么需要这个文件：
+#   实测发现，如果 country 没被正确应用，OpenWrt 会回退到 AU，
+#   而 AU 把 5G 每个频段限制在 @80，导致 htmode=HE160 完全不生效
+#   （网页看起来配了 160，实际只有 80）。见 docs/09-wifi-160mhz-txpower.md。
+#
+#   CN 允许 (5150-5350 @ 160)，所以 160MHz 能跑起来。
+#   代价是要用 DFS 从属信道，开机需等 60 秒 CAC。
+#
+# 这个脚本只在「配置不存在」时执行一次，之后用户改过的不覆盖。
+#
+
+. /lib/functions.sh 2>/dev/null || true
+
+# 只在 radio 还没有 country 时设置，避免覆盖用户手动配置
+cur_country=$(uci -q get wireless.radio0.country || echo "")
+
+if [ -z "$cur_country" ] || [ "$cur_country" = "AU" ]; then
+	# ---- 5G：160MHz，非 DFS 主信道 36，中心信道 50 ----
+	uci -q set wireless.radio0.country='CN'
+	uci -q set wireless.radio0.channel='36'
+	uci -q set wireless.radio0.htmode='HE160'
+	# 23 dBm：CN 下 5G 允许到 30，但 23 更稳，不易自干扰
+	uci -q set wireless.radio0.txpower='23'
+	uci -q set wireless.radio0.cell_density='0'
+
+	# ---- 2.4G：HE40（CN 允许 40MHz），信道 1 ----
+	uci -q set wireless.radio1.country='CN'
+	uci -q set wireless.radio1.channel='1'
+	uci -q set wireless.radio1.htmode='HE40'
+	# 20 dBm 是 CN 对 2.4G 的法规上限，写更高也不生效
+	uci -q set wireless.radio1.txpower='20'
+	uci -q set wireless.radio1.cell_density='0'
+
+	uci -q commit wireless
+	logger -t hk09-wifi "已设置 CN / HE160(5G) / HE40(2.4G)"
+
+	# 强制把 regulatory 也设成 CN
+	# 有些情况下 uci 的 country 不会立即反映到 cfg80211，
+	# 需要显式 iw reg set 才生效（实测必须）。
+	iw reg set CN 2>/dev/null || true
+fi
+
+exit 0

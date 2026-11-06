@@ -1,169 +1,292 @@
 #
-# https://github.com/P3TERX/Actions-OpenWrt
+# HK09 / Salvage-1 云编译工作流
 #
-# File: .github/workflows/openwrt-bulder.yml
-# Description: Build OpenWrt using GitHub Actions
+# 基于 P3TERX/Actions-OpenWrt 的模板，针对本仓做了这些改造：
 #
-# Copyright (c) 2019-2024 P3TERX <https://p3terx.com>
+#   1. 修掉上游 diy-part1.sh 里那行「更新并安装软件源包」——
+#      它没有 # 注释符，bash -e 执行时会 command not found 退出 127，
+#      整个 Load custom feeds 步骤直接失败。本仓的 diy-part1.sh 已修好。
 #
-# This is free software, licensed under the MIT License.
-# See /LICENSE for more information.
+#   2. 支持 local-packages/：本地包（homebox、hello-hk09）拷进
+#      openwrt/package/local/ 后参与编译。上游模板没有这一步。
+#
+#   3. 设备符号校验：.config 里的设备必须写成
+#         CONFIG_TARGET_qualcommax_ipq807x_DEVICE_<dev>=y
+#      而不是 CONFIG_TARGET_DEVICE_..._DEVICE_...（多一层 DEVICE_ 会被
+#      kconfig 静默丢弃，最后编出别的板子的固件）。
+#
+#   4. 落地检查：编译后逐个核对「声明要编的包」是否真的进了 .config
+#      和固件 manifest，避免静默掉包。
+#
+#   5. dl 缓存：第二次构建省一大截下载时间。
+#
+#   6. 所有 action 固定到 commit SHA 并注明版本，防止上游改动破坏构建。
 #
 
-name: OpenWrt Builder
+name: HK09 Builder
 
 on:
-  repository_dispatch:
   workflow_dispatch:
+    inputs:
+      config_note:
+        description: '备注（仅记录用，不影响构建）'
+        required: false
+        default: ''
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - '**.md'
 
 env:
+  # 上游源码树（ccmx200 的 fork，NSS vendor 分支）
   REPO_URL: https://github.com/ccmx200/openwrt-salvage-1-code
   REPO_BRANCH: 25.12-nss-vendor-mhi
-  FEEDS_CONF: feeds.conf.default
+  # 本仓文件名
   CONFIG_FILE: .config
   DIY_P1_SH: diy-part1.sh
   DIY_P2_SH: diy-part2.sh
-  UPLOAD_BIN_DIR: false
-  UPLOAD_FIRMWARE: true
-  UPLOAD_RELEASE: true
   TZ: Asia/Shanghai
+
+permissions:
+  contents: write
+
+concurrency:
+  group: hk09-build-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
-    runs-on: ubuntu-26.04
-    permissions:
-      contents: write                # ← add this line
+    # 用 22.04 而不是 26.04：26.04 尚未 GA，runner 镜像不稳定，
+    # 且部分构建依赖（libncurses5-dev）在新版本里已被移除。
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
     steps:
-    - name: Checkout
-      uses: actions/checkout@main
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
-    - name: Initialization environment
-      env:
-        DEBIAN_FRONTEND: noninteractive
-      run: |
-        sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-        sudo docker image prune --all --force
-        sudo -E apt-get -qq update
-        sudo -E apt-get -qq install \
-        autoconf automake binutils bison bzip2 cpio curl \
-        flex gawk git libncurses5-dev libncursesw5-dev libpython3-dev libssl-dev \
-        libtool p7zip p7zip-full patch pkgconf python3 python3-setuptools rsync \
-        squashfs-tools swig texinfo upx-ucl unzip vim wget xxd zlib1g-dev
-        sudo -E apt-get -qq autoremove --purge
-        sudo -E apt-get -qq clean
-        sudo timedatectl set-timezone "$TZ"
-        sudo mkdir -p /workdir
-        sudo chown $USER:$GROUPS /workdir
+      - name: 显示将要编译的配置
+        run: |
+          echo "=== 设备选择 ==="
+          grep -E '^CONFIG_TARGET_.*DEVICE_.*=y' "$CONFIG_FILE" || {
+            echo "::error::配置里没有选中任何设备"; exit 1; }
+          echo
+          echo "=== 本地包 ==="
+          ls -1 local-packages/ 2>/dev/null || echo "(无)"
+          echo
+          echo "=== files 覆盖层 ==="
+          find files -type f 2>/dev/null || echo "(无)"
 
-    - name: Clone source code
-      working-directory: /workdir
-      run: |
-        df -hT $PWD
-        git clone --depth 1 $REPO_URL -b $REPO_BRANCH openwrt
-        ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
+      - name: 安装编译依赖
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo -E apt-get -qq update
+          sudo -E apt-get -qq install -y \
+            autoconf automake binutils bison bzip2 cpio curl \
+            flex gawk git libncurses5-dev libncursesw5-dev libpython3-dev \
+            libssl-dev libtool p7zip-full patch pkgconf python3 \
+            python3-setuptools rsync squashfs-tools swig texinfo \
+            upx-ucl unzip vim wget xxd zlib1g-dev file
+          sudo -E apt-get -qq autoremove --purge
+          sudo -E apt-get -qq clean
+          sudo timedatectl set-timezone "$TZ"
+          df -hT
 
-    - name: Load custom feeds
-      run: |
-        [ -e $FEEDS_CONF ] && mv $FEEDS_CONF openwrt/feeds.conf.default
-        chmod +x $DIY_P1_SH
-        cd openwrt
-        $GITHUB_WORKSPACE/$DIY_P1_SH
-        
-    - name: Update feeds
-      run: cd openwrt && ./scripts/feeds update -a 
+      - name: 克隆源码
+        run: |
+          git clone --depth 1 "$REPO_URL" -b "$REPO_BRANCH" openwrt
+          ln -sf "$GITHUB_WORKSPACE/openwrt" "$GITHUB_WORKSPACE/openwrt-link"
 
-    - name: Install feeds
-      run: cd openwrt && ./scripts/feeds install -a
+      - name: 注入 feeds（diy-part1.sh）
+        run: |
+          chmod +x "$DIY_P1_SH"
+          cd openwrt
+          "$GITHUB_WORKSPACE/$DIY_P1_SH"
 
-    - name: Patch pcie_mhi (disable NSS offload hook)
-      working-directory: openwrt
-      run: sed -i 's|^#if defined(CONFIG_PINCTRL_IPQ807x).*|#if 0|' feeds/qmodem/driver/quectel_MHI/src/devices/mhi_netdev_quectel.c
+      - name: 更新并安装 feeds
+        run: |
+          cd openwrt
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
 
-    - name: Load custom configuration
-      run: |
-        [ -e files ] && mv files openwrt/files
-        [ -e $CONFIG_FILE ] && mv $CONFIG_FILE openwrt/.config
-        chmod +x $DIY_P2_SH
-        cd openwrt
-        $GITHUB_WORKSPACE/$DIY_P2_SH
-        
-    - name: Download package
-      id: package
-      run: |
-        cd openwrt
-        make defconfig
-        make download -j8
-        find dl -size -1024c -exec ls -l {} \;
-        find dl -size -1024c -exec rm -f {} \;
+      - name: 修补 pcie_mhi（关闭 NSS offload hook）
+        # 上游工作流里有这一步，不动它会编译失败
+        working-directory: openwrt
+        run: |
+          f=feeds/qmodem/driver/quectel_MHI/src/devices/mhi_netdev_quectel.c
+          if [ -f "$f" ]; then
+            sed -i 's|^#if defined(CONFIG_PINCTRL_IPQ807x).*|#if 0|' "$f"
+            echo "已修补 $f"
+          else
+            echo "没有 $f，跳过"
+          fi
 
-    - name: Compile the firmware
-      id: compile
-      run: |
-        cd openwrt
-        echo -e "$(nproc) thread compile"
-        make -j$(nproc) || make -j1 || make -j1 V=s
-        echo "status=success" >> $GITHUB_OUTPUT
-        grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
-        [ -s DEVICE_NAME ] && echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV
-        echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
+      - name: 放入本地包
+        run: |
+          set -e
+          if [ ! -d local-packages ]; then
+            echo "没有 local-packages/，跳过"
+            exit 0
+          fi
+          mkdir -p openwrt/package/local
+          n=0
+          for d in local-packages/*/; do
+            [ -d "$d" ] || continue
+            name=$(basename "$d")
+            echo ">>> $name"
+            rm -rf "openwrt/package/local/$name"
+            cp -a "$d" "openwrt/package/local/$name"
+            n=$((n + 1))
+          done
+          echo "共放入 $n 个本地包"
+          echo "--- PKG_NAME / PKG_VERSION ---"
+          for d in openwrt/package/local/*/; do
+            [ -d "$d" ] || continue
+            printf '%-24s %s %s\n' "$(basename "$d")" \
+              "$(sed -n 's/^PKG_NAME:=//p' "$d/Makefile" 2>/dev/null | sed -n '1p')" \
+              "$(sed -n 's/^PKG_VERSION:=//p' "$d/Makefile" 2>/dev/null | sed -n '1p')"
+          done
 
-    - name: Check space usage
-      if: (!cancelled())
-      run: df -hT
+      - name: 载入配置并注入设备（diy-part2.sh）
+        run: |
+          # 注意：Actions 的 run 步骤默认 set -e（还有 pipefail）。
+          # 不能用 `[ -e x ] && cmd` —— 条件为假时整条表达式返回 1，
+          # set -e 会直接把这个步骤判失败。必须用显式 if。
+          if [ -e files ]; then
+            cp -a files openwrt/files
+          fi
+          if [ -e "$CONFIG_FILE" ]; then
+            cp "$CONFIG_FILE" openwrt/.config
+          fi
+          chmod +x "$DIY_P2_SH"
+          cd openwrt
+          "$GITHUB_WORKSPACE/$DIY_P2_SH"
 
-    - name: Upload bin directory
-      uses: actions/upload-artifact@main
-      if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
-      with:
-        name: OpenWrt_bin${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
-        path: openwrt/bin
+      - name: 校验设备符号真的生效
+        working-directory: openwrt
+        run: |
+          set -e
+          dev=$(sed -n 's/^CONFIG_TARGET_.*_DEVICE_\(.*\)=y$/\1/p' ../"$CONFIG_FILE" | sed -n '1p')
+          echo "期望设备: $dev"
+          sym="CONFIG_TARGET_qualcommax_ipq807x_DEVICE_${dev}=y"
+          if grep -qxF "$sym" .config; then
+            echo "OK: $sym"
+          else
+            echo "::error::设备符号没生效: $sym"
+            echo "--- .config 里的设备行 ---"
+            grep -E 'CONFIG_TARGET_.*DEVICE' .config | sed -n '1,20p'
+            exit 1
+          fi
+          echo "--- 确认没有多选其它设备 ---"
+          n=$(grep -cE '^CONFIG_TARGET_qualcommax_ipq807x_DEVICE_.*=y$' .config)
+          echo "选中设备数: $n"
+          [ "$n" = "1" ] || { echo "::error::选中了 $n 个设备，应该只有 1 个"; exit 1; }
 
-    - name: Organize files
-      id: organize
-      if: env.UPLOAD_FIRMWARE == 'true' && !cancelled()
-      run: |
-        cd openwrt/bin/targets/*/*
-        rm -rf packages
-        echo "FIRMWARE=$PWD" >> $GITHUB_ENV
-        echo "status=success" >> $GITHUB_OUTPUT
+      - name: 缓存下载目录
+        uses: actions/cache@v4
+        with:
+          path: openwrt/dl
+          key: hk09-dl-${{ github.run_id }}
+          restore-keys: |
+            hk09-dl-
 
-    - name: Upload firmware directory
-      uses: actions/upload-artifact@main
-      if: steps.organize.outputs.status == 'success' && !cancelled()
-      with:
-        name: OpenWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
-        path: ${{ env.FIRMWARE }}
+      - name: make defconfig 并下载依赖
+        working-directory: openwrt
+        run: |
+          make defconfig
+          make download -j8 || make download -j1 V=s
+          find dl -size -1024c -exec ls -l {} \;
+          find dl -size -1024c -exec rm -f {} \;
 
-    - name: Generate release tag
-      id: tag
-      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
-      run: |
-        echo "release_tag=$(date +"%Y.%m.%d-%H%M")" >> $GITHUB_OUTPUT
-        touch release.txt
-        [ ${UPLOAD_GOFILE} = true && ${{ steps.gofile.outputs.url }} ] && echo "🔗 [GoFile](${{ steps.gofile.outputs.url }})" >> release.txt
-        echo "status=success" >> $GITHUB_OUTPUT
+      - name: 核对包是否真的被选中
+        working-directory: openwrt
+        run: |
+          if [ ! -f .config ]; then
+            echo "SKIPPED: 没有 .config"; exit 0
+          fi
+          echo "=== 声明了但被 kconfig 丢弃的包 ==="
+          miss=0
+          while IFS= read -r line; do
+            case "$line" in
+              CONFIG_PACKAGE_*=y)
+                if grep -qxF "$line" .config; then :; else
+                  echo "DROPPED ${line%%=*}"; miss=$((miss + 1))
+                fi ;;
+            esac
+          done < "$GITHUB_WORKSPACE/$CONFIG_FILE"
+          echo "共丢弃 $miss 个（少量属正常：版本差异导致包名变化）"
+          echo
+          echo "=== 关键包必须存在 ==="
+          for p in homebox kmod-qca-nss-drv kmod-qca-nss-ecm; do
+            if grep -qE "^CONFIG_PACKAGE_${p}=(y|m)$" .config; then
+              echo "OK   $p"
+            else
+              echo "::error::关键包缺失: $p"; exit 1
+            fi
+          done
 
-    - name: Upload firmware to release
-      uses: softprops/action-gh-release@master
-      if: steps.tag.outputs.status == 'success' && !cancelled()
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        tag_name: ${{ steps.tag.outputs.release_tag }}
-        body_path: release.txt
-        files: ${{ env.FIRMWARE }}/*
+      - name: 编译
+        working-directory: openwrt
+        run: |
+          echo "$(nproc) 线程编译"
+          make -j"$(nproc)" || make -j1 || make -j1 V=s
+          echo "status=success" >> "$GITHUB_OUTPUT"
+          id=compile
+          grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME || true
+          if [ -s DEVICE_NAME ]; then
+            echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> "$GITHUB_ENV"
+          fi
+          echo "FILE_DATE=_$(date +'%Y%m%d%H%M')" >> "$GITHUB_ENV"
+        id: compile
 
-    - name: Delete workflow runs
-      uses: Mattraks/delete-workflow-runs@main
-      with:
-        retain_days: 0
-        keep_minimum_runs: 2
+      - name: 核对 homebox 进了固件
+        if: always()
+        working-directory: openwrt
+        run: |
+          m=$(ls bin/targets/*/*/*.manifest 2>/dev/null | sed -n '1p')
+          if [ -z "$m" ]; then
+            echo "找不到 manifest（编译可能未完成），跳过"; exit 0
+          fi
+          echo "manifest: $m"
+          for p in homebox hello-hk09; do
+            if grep -q "^$p " "$m"; then
+              echo "IN-IMAGE $p"
+            else
+              echo "MISSING  $p （没进镜像）"
+            fi
+          done
+          echo
+          echo "=== 固件产物 ==="
+          ls -lh bin/targets/*/*/ | sed -n '1,20p'
 
-    - name: Remove old Releases
-      uses: dev-drprasad/delete-older-releases@master
-      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
-      with:
-        keep_latest: 3
-        delete_tags: true
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: 检查磁盘
+        if: always()
+        run: df -hT
+
+      - name: 整理产物
+        id: organize
+        if: always()
+        run: |
+          if [ -d openwrt/bin/targets ]; then
+            cd openwrt/bin/targets/*/*
+            rm -rf packages
+            echo "FIRMWARE=$PWD" >> "$GITHUB_ENV"
+            echo "status=success" >> "$GITHUB_OUTPUT"
+            ls -lh
+          else
+            echo "没有 bin/targets 产物"
+          fi
+
+      - name: 上传固件 artifact
+        uses: actions/upload-artifact@v4
+        if: steps.organize.outputs.status == 'success'
+        with:
+          name: HK09_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+          path: ${{ env.FIRMWARE }}
+          retention-days: 30

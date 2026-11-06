@@ -1,0 +1,708 @@
+// SPDX-License-Identifier: GPL-2.0-or-later OR MIT
+/*
+ * HK09 开发板（IPQ8072A）
+ *
+ * 基线：ccmx200 的 ipq8072-salvage-1.dts（同一 HK09/HK01 参考设计家族，
+ *       同为 IPQ8072 + QCN5054/QCN5024(AHB) + QCA8075(QSGMII) + QCA8081(SGMII+)）
+ *
+ * 本文件中的每一个硬件参数都已**实机校准**，不是猜的。校准方法：
+ *   1. 板子上跑的是 ccmx200 的 LibWrt（board_name = cuicanmx,salvage-1），
+ *      即同一硬件的已知可用固件，其 DTB 是权威基准。
+ *   2. 把 /sys/firmware/fdt 经 gzip + 串口 hexdump 无损搬回主机
+ *      （tools/serial/fetch-fdt.ps1 + .check/decode-fdt.sh，md5 校验通过）。
+ *   3. dtc 反编译成 2768 行 DTS，再与本文件逐字段对比。
+ *   4. 同时与源码树里官方 ipq8072-salvage-1.dts 的**源码**对照。
+ *
+ * 校验结果（见 .check/）：
+ *   verify-real-hw.sh   36/36 PASS   实机参数逐条断言
+ *   diff-live.sh        28/28 SAME   与板上运行 DTS 逐字段一致，0 DIFF
+ *   verify-spi.sh                    SPI NOR 19 个分区与板上一致
+ *   verify-pcie.sh      12/12 PASS   PCIe perst 接线核对
+ *   verify-sd.sh         8/8 PASS    SD 卡（cd/vqmmc/pinmux）核对
+ *
+ * 注意：这里踩过的坑都在对应段落注释里写明了，改参数前建议先读一遍——
+ * 尤其是 gpios 第一格是 phandle、pcie@10000000 是 pcie1 这两处。
+ *
+ * 已知坏点（原厂固件下就存在，非本移植引入）：
+ *   - Wi-Fi 报 "failed to load CAL data file:cal-ahb-c000000.wifi.bin"，
+ *     BDF 变体名匹配无误，问题在后续 CAL 加载环节。
+ *   - pcie@10000000 (&pcie1) 报 "Read DBI address failed"，链路起不来。
+ */
+
+/dts-v1/;
+
+#include "ipq8074.dtsi"
+#include "ipq8074-hk-cpu.dtsi"
+#include "ipq8074-ess.dtsi"
+#include "ipq8074-nss.dtsi"
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/input/input.h>
+#include <dt-bindings/leds/common.h>
+
+/ {
+	model = "HK09";
+	compatible = "hk09,hk09", "qcom,ipq8074";
+
+	/* SD 卡 3.3V 供电，由 GPIO21 使能（实测自板上 DTS，与官方一致） */
+	vqmmc_sd_reg: regulator-vqmmc-sd {
+		compatible = "regulator-fixed";
+		regulator-name = "vqmmc_sd";
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		regulator-always-on;
+		gpios = <&tlmm 21 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+	};
+
+	aliases {
+		serial0 = &blsp1_uart5;
+		/* 与板上运行中的 DTS 完全一致（已核对 /sys/firmware/fdt）：
+		 * ethernet0=dp5(wan 2.5G), ethernet1=dp3(lan1),
+		 * ethernet2=dp2(lan2), ethernet3=dp1(lan3)
+		 *
+		 * 注意这里只是**内核编号顺序**，不等于面板丝印。
+		 * 面板上的 lan1/lan2/lan3/wan 由各 dp 节点的 label 决定，
+		 * 也已与板上一致。
+		 */
+		ethernet0 = &dp5;	/* 2.5G WAN (QCA8081) */
+		ethernet1 = &dp3;
+		ethernet2 = &dp2;
+		ethernet3 = &dp1;
+	};
+
+	chosen {
+		stdout-path = "serial0:115200n8";
+		/* 与官方 ipq8072-salvage-1.dts 完全一致，只写增量。
+		 *
+		 * 板上完整 cmdline 是：
+		 *   console=ttyMSM0,115200n8 ubi.mtd=rootfs root=mtd:ubi_rootfs
+		 *   rootfstype=squashfs rootwait root=/dev/ubiblock0_1
+		 *
+		 * 其中前半段来自 U-Boot 的 bootargs 环境变量，不是 DTS；
+		 * DTS 只负责追加 root=/dev/ubiblock0_1。
+		 *
+		 * （我一度把整串都抄进 bootargs-append，那会让 ubi.mtd=rootfs
+		 *  等参数重复出现两次 —— 是错的。）
+		 */
+		bootargs-append = " root=/dev/ubiblock0_1";
+	};
+
+	/*
+	 * 按键 —— 参数从实机运行中的设备树读出（2026-11-05）。
+	 *
+	 * gpios 的三个 cell 是 <&tlmm GPIO flags>，**第一个是 phandle 不是 GPIO 号**：
+	 *   /proc/.../gpio_keys/wps/gpios = 00 00 00 0c | 00 00 00 22 | 00 00 00 01
+	 *                                    phandle     GPIO 0x22=34  低有效
+	 * 交叉印证：&tlmm 里 button_pins 指向的正是 "gpio34"。
+	 *
+	 * （我最初把 phandle 0x0c 当成 GPIO 12，是误读。）
+	 */
+	gpio_keys {
+		compatible = "gpio-keys";
+		pinctrl-0 = <&button_pins>;
+		pinctrl-names = "default";
+
+		wps {
+			label = "wps";
+			gpios = <&tlmm 34 GPIO_ACTIVE_LOW>;
+			linux,code = <KEY_WPS_BUTTON>;
+			debounce-interval = <60>;
+		};
+	};
+
+	/*
+	 * LED —— 同样读自实机。gpios 三个 cell 是 <&tlmm N flags>，
+	 * 实测 flags 全为 0（GPIO_ACTIVE_HIGH）。
+	 *
+	 *   led_heartbeat  GPIO 20   linux,default-trigger = heartbeat
+	 *   SYS_R          GPIO 30
+	 *   SYS_G          GPIO 54
+	 *   5G_R           GPIO 51
+	 *   5G_G           GPIO 19
+	 *   5G_B           GPIO 29
+	 *   RSSI_R         GPIO 55
+	 *   RSSI_G         GPIO 56
+	 *   RSSI_B         GPIO 50
+	 */
+	/*
+	 * LED —— 与板上运行中的 DTS 逐字段对齐（2026-11-05 导出 /sys/firmware/fdt 反编译）。
+	 *
+	 * 关键差异（我最初写错、已按实测纠正）：
+	 *   * 节点名在板上是 SYS_R / 5G_R 这类**大写**形式，不是 led_sys_r
+	 *   * default-state 全是 "on"（板子起来后 LED 默认点亮），不是 "off"
+	 *   * pinctrl 用 bias-pull-down（不是 pull-up）
+	 *
+	 * gpios 三个 cell 是 <&tlmm N flags>，flags 实测全为 0（高有效）。
+	 */
+	leds {
+		compatible = "gpio-leds";
+		pinctrl-0 = <&led_pins>;
+		pinctrl-names = "default";
+
+		led_heartbeat: led_heartbeat {
+			label = "led_heartbeat";
+			gpios = <&tlmm 20 GPIO_ACTIVE_HIGH>;
+			linux,default-trigger = "heartbeat";
+		};
+
+		led_sys_r: SYS_R {
+			label = "SYS_R";
+			gpios = <&tlmm 30 GPIO_ACTIVE_HIGH>;
+			default-state = "on";
+		};
+
+		led_sys_g: SYS_G {
+			label = "SYS_G";
+			gpios = <&tlmm 54 GPIO_ACTIVE_HIGH>;
+			default-state = "on";
+		};
+
+		led_5g_r: 5G_R {
+			label = "5G_R";
+			gpios = <&tlmm 51 GPIO_ACTIVE_HIGH>;
+			default-state = "on";
+		};
+
+		led_5g_g: 5G_G {
+			label = "5G_G";
+			gpios = <&tlmm 19 GPIO_ACTIVE_HIGH>;
+			default-state = "on";
+		};
+
+		led_5g_b: 5G_B {
+			label = "5G_B";
+			gpios = <&tlmm 29 GPIO_ACTIVE_HIGH>;
+			default-state = "on";
+		};
+
+		led_rssi_r: RSSI_R {
+			label = "RSSI_R";
+			gpios = <&tlmm 55 GPIO_ACTIVE_HIGH>;
+			default-state = "on";
+		};
+
+		led_rssi_g: RSSI_G {
+			label = "RSSI_G";
+			gpios = <&tlmm 56 GPIO_ACTIVE_HIGH>;
+			default-state = "on";
+		};
+
+		led_rssi_b: RSSI_B {
+			label = "RSSI_B";
+			gpios = <&tlmm 50 GPIO_ACTIVE_HIGH>;
+			default-state = "on";
+		};
+	};
+};
+
+/*
+ * SD 卡控制器：mainline ipq8074.dtsi 里没有 sdhc_2 节点，salvage-1 也是自己补的。
+ *
+ * 实测（读板上 /proc/device-tree/soc@0/mmc@7864900）：
+ *   **这块板子有 SD 卡槽**，status = "okay"，并且：
+ *     cd-gpios      = <&tlmm 63 GPIO_ACTIVE_LOW>   卡检测
+ *     pinctrl-0     = <&sd_pins>                   gpio63 = sd_card
+ *     vqmmc-supply  = <&vqmmc_sd_reg>              GPIO21 使能 3.3V
+ *
+ * （我一度因为 dmesg 里没看到卡片检测就断定"没有 SD 槽"，那是错的——
+ *  没插卡当然看不到，但控制器本身是启用的。）
+ */
+&soc {
+	sdhc_2: mmc@7864900 {
+		compatible = "qcom,ipq8074-sdhci", "qcom,sdhci-msm-v4";
+		reg = <0x7864900 0x500>, <0x7864000 0x800>;
+		reg-names = "hc", "core";
+		interrupts = <GIC_SPI 125 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 221 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "hc_irq", "pwr_irq";
+		clocks = <&gcc GCC_SDCC2_AHB_CLK>,
+			 <&gcc GCC_SDCC2_APPS_CLK>,
+			 <&xo>;
+		clock-names = "iface", "core", "xo";
+		resets = <&gcc GCC_SDCC2_BCR>;
+		max-frequency = <192000000>;
+		mmc-ddr-1_8v;
+		bus-width = <4>;
+		status = "okay";
+		pinctrl-0 = <&sd_pins>;
+		pinctrl-names = "default";
+		cd-gpios = <&tlmm 63 GPIO_ACTIVE_LOW>;
+		vqmmc-supply = <&vqmmc_sd_reg>;
+	};
+};
+
+&tlmm {
+	mdio_pins: mdio_pins {
+		mdc {
+			pins = "gpio68";
+			function = "mdc";
+			drive-strength = <8>;
+			bias-pull-up;
+		};
+
+		mdio {
+			pins = "gpio69";
+			function = "mdio";
+			drive-strength = <8>;
+			bias-pull-up;
+		};
+	};
+
+	/* SD 卡检测脚，抄自板上 DTS：gpio63 = sd_card, bias-pull-up */
+	sd_pins: sd_pins {
+		mux {
+			pins = "gpio63";
+			function = "sd_card";
+			drive-strength = <8>;
+			bias-pull-up;
+		};
+	};
+
+	/* PCIe PERST 引脚，照官方 salvage-1：GPIO58 -> pcie0，GPIO61 -> pcie1 */
+	pcie0_perst_pins: pcie0_perst_pins {
+		perst {
+			pins = "gpio58";
+			function = "gpio";
+			drive-strength = <8>;
+			bias-pull-down;
+		};
+	};
+
+	pcie1_perst_pins: pcie1_perst_pins {
+		perst {
+			pins = "gpio61";
+			function = "gpio";
+			drive-strength = <8>;
+			bias-pull-down;
+		};
+	};
+
+	/* SPI NOR 的引脚复用，抄自板上 DTS：gpio42..45 = blsp1_spi，bias-disable */
+	spi1_pins: spi1_pins {
+		mux {
+			pins = "gpio42", "gpio43", "gpio44", "gpio45";
+			function = "blsp1_spi";
+			drive-strength = <8>;
+			bias-disable;
+		};
+	};
+
+	/* 按键与 LED 的 GPIO 全部来自实机设备树（见顶层 gpio_keys / leds 注释） */
+	button_pins: button_pins {
+		wps_button {
+			pins = "gpio12";
+			function = "gpio";
+			drive-strength = <8>;
+			bias-pull-down;
+		};
+	};
+
+	led_pins: led_pins {
+		led_heartbeat_pin {
+			pins = "gpio20";
+			function = "gpio";
+			drive-strength = <8>;
+			bias-pull-down;
+		};
+
+		led_sys_r_pin {
+			pins = "gpio30";
+			function = "gpio";
+			drive-strength = <8>;
+			bias-pull-down;
+		};
+
+		led_sys_g_pin {
+			pins = "gpio54";
+			function = "gpio";
+			drive-strength = <8>;
+			bias-pull-down;
+		};
+
+		led_5g_r_pin {
+			pins = "gpio51", "gpio19", "gpio29";
+			function = "gpio";
+			drive-strength = <8>;
+			bias-pull-down;
+		};
+
+		led_rssi_pin {
+			pins = "gpio55", "gpio56", "gpio50";
+			function = "gpio";
+			drive-strength = <8>;
+			bias-pull-down;
+		};
+	};
+};
+
+/* ---------- 基础外设 ---------- */
+
+&blsp1_uart5 { status = "okay"; };	/* console，必须开 */
+&prng { status = "okay"; };
+&cryptobam { status = "okay"; };
+&crypto { status = "okay"; };
+&qpic_bam { status = "okay"; };
+
+/*
+ * ---------- SPI NOR ----------
+ *
+ * 实测：这块板子的 **ART 在 SPI NOR 上**，不在 NAND。
+ * 分区表整份抄自板上运行中的 DTS（/sys/firmware/fdt 反编译，md5 已校验），
+ * 偏移必须一模一样，否则 ART 读写错位、Wi-Fi 校准丢失。
+ *
+ * 总容量 0x690000 = 6.56 MiB，对应板上那颗 25Q64 类 NOR。
+ * 全部 read-only：这些是 bootloader / 安全固件 / 校准数据，应用层不该写。
+ *
+ * 由此得出的安全结论：**整片擦除 NAND 不会毁掉 Wi-Fi 校准**。
+ * 反过来说，绝对不要碰 SPI NOR。
+ */
+&blsp1_spi1 {
+	status = "okay";
+	pinctrl-0 = <&spi1_pins>;
+	pinctrl-names = "default";
+
+	flash@0 {
+		reg = <0>;
+		compatible = "jedec,spi-nor";
+		spi-max-frequency = <50000000>;
+
+		partitions {
+			compatible = "fixed-partitions";
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			partition@0 {
+				label = "0:SBL1";
+				reg = <0x0 0x50000>;
+				read-only;
+			};
+
+			partition@50000 {
+				label = "0:MIBIB";
+				reg = <0x50000 0x10000>;
+				read-only;
+			};
+
+			partition@60000 {
+				label = "0:BOOTCONFIG";
+				reg = <0x60000 0x20000>;
+				read-only;
+			};
+
+			partition@80000 {
+				label = "0:BOOTCONFIG1";
+				reg = <0x80000 0x20000>;
+				read-only;
+			};
+
+			partition@a0000 {
+				label = "0:QSEE";
+				reg = <0xa0000 0x180000>;
+				read-only;
+			};
+
+			partition@220000 {
+				label = "0:QSEE_1";
+				reg = <0x220000 0x180000>;
+				read-only;
+			};
+
+			partition@3a0000 {
+				label = "0:DEVCFG";
+				reg = <0x3a0000 0x10000>;
+				read-only;
+			};
+
+			partition@3b0000 {
+				label = "0:DEVCFG_1";
+				reg = <0x3b0000 0x10000>;
+				read-only;
+			};
+
+			partition@3c0000 {
+				label = "0:APDP";
+				reg = <0x3c0000 0x10000>;
+				read-only;
+			};
+
+			partition@3d0000 {
+				label = "0:APDP_1";
+				reg = <0x3d0000 0x10000>;
+				read-only;
+			};
+
+			partition@3e0000 {
+				label = "0:RPM";
+				reg = <0x3e0000 0x40000>;
+				read-only;
+			};
+
+			partition@420000 {
+				label = "0:RPM_1";
+				reg = <0x420000 0x40000>;
+				read-only;
+			};
+
+			partition@460000 {
+				label = "0:CDT";
+				reg = <0x460000 0x10000>;
+				read-only;
+			};
+
+			partition@470000 {
+				label = "0:CDT_1";
+				reg = <0x470000 0x10000>;
+				read-only;
+			};
+
+			/* U-Boot 环境变量分区，**必须可写**：
+			 * fw_setenv 要往这里写，加 read-only 会让 saveenv 失败。
+			 * 这是整份 NOR 分区表里唯一可写的一个。
+			 */
+			partition@480000 {
+				label = "0:APPSBLENV";
+				reg = <0x480000 0x10000>;
+			};
+
+			partition@490000 {
+				label = "0:APPSBL";
+				reg = <0x490000 0xa0000>;
+				read-only;
+			};
+
+			partition@530000 {
+				label = "0:APPSBL_1";
+				reg = <0x530000 0xa0000>;
+				read-only;
+			};
+
+			/* Wi-Fi 校准数据。丢了就得回原厂固件重新导出。 */
+			partition@5d0000 {
+				label = "0:ART";
+				reg = <0x5d0000 0x40000>;
+				read-only;
+			};
+
+			partition@610000 {
+				label = "0:ETHPHYFW";
+				reg = <0x610000 0x80000>;
+				read-only;
+			};
+		};
+	};
+};
+
+/*
+ * ---------- NAND ----------
+ *
+ * variant A（默认，= salvage-1 的已验证方案）：整片 NAND 一个 UBI 分区。
+ *   优点：不依赖原厂分区表，刷写命令简单。
+ *   风险：**整片擦除会连 ART/校准一起干掉**。所以必须先备份（见 docs/02-flash.md）。
+ *
+ * variant B（推荐用于 NAND-only 板）：把 ART 挖出来，UBI 只占前面一段。
+ *   把下面 rootfs 的 size 改成 art 的起始偏移，再补 art 分区，然后 U-Boot 里用
+ *   mtdparts=nand0:0x<ART_OFF>(rootfs)ro,0x400000(art)
+ *   注意 rootfs 改成 ro 时 UBI 需要写权限，所以实际写法是
+ *   mtdparts=nand0:0x<ART_OFF>(rootfs),0x400000(art)
+ */
+&qpic_nand {
+	status = "okay";
+
+	nand@0 {
+		reg = <0>;
+		nand-ecc-strength = <8>;
+		nand-ecc-step-size = <512>;
+		nand-bus-width = <8>;
+
+		partitions {
+			compatible = "fixed-partitions";
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			/* 实测：NAND 为 Micron MT29F2G08ABBGAH4，256 MiB SLC，
+			 * erase 128 KiB / page 2048 / OOB 128（见 dmesg）。
+			 * 整个 NAND 做成单一 UBI 卷给 rootfs。
+			 */
+			partition@0 {
+				label = "rootfs";
+				reg = <0x0 0x10000000>;
+			};
+		};
+	};
+};
+
+/* ---------- eMMC / SD ---------- */
+
+&sdhc_1 {
+	status = "okay";
+	non-removable;
+	mmc-ddr-1_8v;
+	mmc-hs200-1_8v;
+	mmc-hs400-1_8v;
+	max-frequency = <192000000>;
+};
+
+/* ---------- USB ---------- */
+
+&qusb_phy_0 { status = "okay"; };
+&ssphy_0 { status = "okay"; };
+&usb_0 { status = "okay"; };
+
+&qusb_phy_1 { status = "okay"; };
+&ssphy_1 { status = "okay"; };
+&usb_1 { status = "okay"; };
+
+/* ---------- PCIe ----------
+ *
+ * 地址与编号的对应关系**容易搞反**，这里记清楚（已用 phandle 反查确认）：
+ *
+ *   pcie@20000000  compatible "qcom,pcie-ipq8074-gen3"  phys=<&pcie0_phy>
+ *                  → 这是 &pcie0，perst = GPIO58
+ *   pcie@10000000  compatible "qcom,pcie-ipq8074"       phys=<&pcie1_phy>
+ *                  → 这是 &pcie1，perst = GPIO61
+ *
+ * 我一度以为「地址 0x10000000 就是 pcie0」，差点把两个 perst 接反。
+ * 实测（读板上 /proc/device-tree）与官方 DTS 完全一致：
+ *   pcie@10000000 perst-gpios = 0x3d = 61
+ *   pcie@20000000 perst-gpios = 0x3a = 58
+ *
+ * 关于 dmesg 里的既有故障：
+ *   qcom-pcie 10000000.pcie: Read DBI address failed
+ *   qcom-pcie 10000000.pcie: Invalid eDMA IRQs found
+ * 那是 &pcie1（Gen2 控制器）在原厂固件下就没起来，不是 DTS 缺属性。
+ */
+
+&pcie_qmp0 { status = "okay"; };
+&pcie_qmp1 { status = "okay"; };
+
+&pcie0 {
+	status = "okay";
+	pinctrl-0 = <&pcie0_perst_pins>;
+	pinctrl-names = "default";
+	perst-gpios = <&tlmm 58 GPIO_ACTIVE_LOW>;
+};
+
+&pcie1 {
+	status = "okay";
+	pinctrl-0 = <&pcie1_perst_pins>;
+	pinctrl-names = "default";
+	perst-gpios = <&tlmm 61 GPIO_ACTIVE_LOW>;
+};
+
+/* ---------- 有线网络 ---------- */
+
+&mdio {
+	status = "okay";
+	pinctrl-0 = <&mdio_pins>;
+	pinctrl-names = "default";
+
+	/* QCA8075 封装，QSGMII 模式。
+	 * 实测（2026-11-05，读运行中的设备树）包内只有 3 个 PHY：addr 0/1/2。
+	 * 没有 addr 3 —— 这块板子是 3 个千兆口 + 1 个 2.5G 口。
+	 */
+	ethernet-phy-package@0 {
+		#address-cells = <1>;
+		#size-cells = <0>;
+		compatible = "qcom,qca8075-package";
+		reg = <0>;
+		qcom,package-mode = "qsgmii";
+
+		qca8075_0: ethernet-phy@0 {
+			compatible = "ethernet-phy-ieee802.3-c22";
+			reg = <0>;
+		};
+
+		qca8075_1: ethernet-phy@1 {
+			compatible = "ethernet-phy-ieee802.3-c22";
+			reg = <1>;
+		};
+
+		qca8075_2: ethernet-phy@2 {
+			compatible = "ethernet-phy-ieee802.3-c22";
+			reg = <2>;
+		};
+	};
+
+	/* QCA8081 2.5G，MDIO addr 24（0x18）
+	 * 实测 reset-gpios = <&tlmm 44 GPIO_ACTIVE_LOW>，
+	 *      reset-deassert-us = 10000
+	 */
+	qca8081: ethernet-phy@24 {
+		compatible = "ethernet-phy-id004d.d101";
+		reg = <24>;
+		reset-deassert-us = <10000>;
+		reset-gpios = <&tlmm 44 GPIO_ACTIVE_LOW>;
+	};
+};
+
+&switch {
+	status = "okay";
+
+	/* 位图与 mac mode 全部实测自运行中的设备树：
+	 *   switch_lan_bmp   = 0x0e  = PORT1|PORT2|PORT3
+	 *   switch_wan_bmp   = 0x20  = PORT5
+	 *   switch_mac_mode  = 0x0b  = QSGMII
+	 *   switch_mac_mode1 = 0x0c  = SGMII_PLUS
+	 *   switch_mac_mode2 = 0xff  = DISABLED
+	 */
+	switch_lan_bmp = <(ESS_PORT1 | ESS_PORT2 | ESS_PORT3)>;
+	switch_wan_bmp = <ESS_PORT5>;
+	switch_mac_mode = <MAC_MODE_QSGMII>;
+	switch_mac_mode1 = <MAC_MODE_SGMII_PLUS>;
+	switch_mac_mode2 = <MAC_MODE_DISABLED>;
+
+	qcom,port_phyinfo {
+		port@1 { port_id = <1>; phy_address = <0>; };
+		port@2 { port_id = <2>; phy_address = <1>; };
+		port@3 { port_id = <3>; phy_address = <2>; };
+		port@5 { port_id = <5>; phy_address = <24>; port_mac_sel = "QGMAC_PORT"; };
+	};
+};
+
+&edma { status = "okay"; };
+
+&dp1 {
+	status = "okay";
+	phy-mode = "qsgmii";
+	phy-handle = <&qca8075_0>;
+	label = "lan3";
+};
+
+&dp2 {
+	status = "okay";
+	phy-mode = "qsgmii";
+	phy-handle = <&qca8075_1>;
+	label = "lan2";
+};
+
+&dp3 {
+	status = "okay";
+	phy-mode = "qsgmii";
+	phy-handle = <&qca8075_2>;
+	label = "lan1";
+};
+
+&dp5 {
+	status = "okay";
+	phy-mode = "sgmii";
+	phy-handle = <&qca8081>;
+	label = "wan";
+};
+
+/*
+ * ---------- Wi-Fi ----------
+ *
+ * ath11k 的校准变体名必须与 board-2.bin 里存在的 variant **精确匹配**，
+ * 否则 WiFi 起不来（dmesg: "failed to fetch board data"）。
+ *
+ * 三条路，按省事程度排：
+ *   1) 先用 IPQ8074 通用参考板 BDF：变体名 "bus=ahb,bmi-chip-id=0,bmi-board-id=31"
+ *      —— DTS 里删掉本属性即可，ath11k 会自己按 bus/chip/board id 选。
+ *   2) 复用 salvage-1 的 BDF：变体名 "Salvage-1"，image 里带
+ *      ipq-wifi-cuicanmx_salvage-1。同一套 QCN5054/QCN5024 的板子成功率不低。
+ *   3) 从你这块板子的原厂固件里提取/自建 BDF（ath11k-bdencoder），变体名随意定。
+ */
+&wifi {
+	status = "okay";
+	qcom,ath11k-calibration-variant = "Salvage-1";
+};

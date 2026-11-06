@@ -1,0 +1,60 @@
+#!/bin/sh
+#
+# HK09 性能默认值（uci-defaults，只在首次启动/恢复出厂后执行一次）
+#
+# 背景：实测板子本身完全空闲（load 0.04、内存 244/884 MB、ping 0ms、
+# TCP 握手 1ms），但打开 LuCI 明显慢。定位到 uhttpd 的两个默认值不合理：
+#
+#   option max_requests 3
+#       同时只处理 3 个请求。LuCI 首屏要加载 10+ 个 JS/CSS，
+#       浏览器并发 6 个，服务器只吃 3 个，其余排队。
+#       实测单个文件预热后只要 42ms，但 10 个文件合计 1783ms
+#       —— 就是排队造成的。
+#
+#   option max_connections 100
+#       连接数够，不是瓶颈。
+#
+# 另外 uhttpd **不支持 gzip 压缩**（实测带 Accept-Encoding: gzip
+# 请求，返回 Content-Encoding 为空），575 KB 的 LuCI 资源全部明文传输。
+# 这个改配置解决不了，但预压缩静态文件可以缓解（见下方 precompressed）。
+#
+
+. /lib/functions.sh 2>/dev/null || true
+
+# 只在配置还是默认值时调整，不覆盖用户手动改过的值
+cur=$(uci -q get uhttpd.main.max_requests || echo "")
+
+if [ -z "$cur" ] || [ "$cur" -le 3 ] 2>/dev/null; then
+	# 20 是折中值：足够浏览器并发，又不会在 1GB 内存的小机器上失控
+	uci -q set uhttpd.main.max_requests='20'
+	uci -q set uhttpd.main.max_connections='200'
+
+	# script_timeout/network_timeout 默认 60/30 秒偏保守，
+	# LuCI 有些页面（如状态页读 NSS 统计）会稍慢，缩短到 30/15
+	# 可以让卡住的请求更快失败重试，而不是一直转圈。
+	uci -q set uhttpd.main.script_timeout='30'
+	uci -q set uhttpd.main.network_timeout='15'
+
+	uci -q commit uhttpd
+	logger -t hk09-perf "uhttpd: max_requests=20 max_connections=200"
+
+	# 立即重启生效（首次启动时 uhttpd 可能还没起，忽略错误）
+	/etc/init.d/uhttpd restart 2>/dev/null || true
+fi
+
+# ---- 静态资源预压缩 ----
+# uhttpd 不压缩，但会优先发送已存在的 .gz 文件（如果编译时带了
+# UHTTPD_PRECOMPRESSED 支持）。这里把 /www 下的大文件预压缩一份，
+# 能省下约 2/3 传输量。
+#
+# 注意：这一步只在有 gzip 命令且文件够大时才做，避免启动变慢。
+if command -v gzip >/dev/null 2>&1; then
+	n=0
+	for f in $(find /www/luci-static -type f \( -name '*.js' -o -name '*.css' -o -name '*.svg' \) -size +4k 2>/dev/null); do
+		[ -f "$f.gz" ] && continue
+		gzip -9 -c "$f" > "$f.gz" 2>/dev/null && n=$((n + 1))
+	done
+	[ "$n" -gt 0 ] && logger -t hk09-perf "预压缩了 $n 个静态资源"
+fi
+
+exit 0
