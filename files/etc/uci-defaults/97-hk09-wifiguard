@@ -1,0 +1,13 @@
+#!/bin/sh
+# uci-defaults: 首次启动时把 hk09-wifiguard 设为开机自启。
+#
+# 为什么用 uci-defaults 而不是直接建 rc.d 软链：
+#   /etc/rc.d/ 由 /etc/init.d/ 在构建期扫描生成，固件里放软链容易在
+#   打包时被 strip 掉或权限不对；uci-defaults 是 OpenWrt 的官方推荐做法，
+#   只在**首次**启动（或删除 /etc/uci-defaults 里的文件后）执行一次。
+
+/etc/init.d/hk09-wifiguard enable 2>/dev/null
+/etc/init.d/hk09-wifiguard start 2>/dev/null
+
+# 标记这个脚本执行完就不再跑（uci-defaults 的约定：成功退出就删除自己）
+exit 0

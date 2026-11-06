@@ -83,6 +83,77 @@ die() { printf '\033[1;31m[hk09] ERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 log "项目根 = ${SRC}"
 [ -d target/linux/qualcommax ] || die "当前目录不是 openwrt 源码树根（缺 target/linux/qualcommax）"
 
+# ------------------------------------------------------- 0b. pstore（崩溃现场）
+# 目的：本板会"跑一会儿整机重启"，但 /sys/fs/pstore/ 永远是空的，抓不到现场。
+#
+# 已确认（板子实际启动日志）：
+#   OF: reserved mem: 0x51100000..0x511fffff (1024 KiB) nomap non-reusable ramoops@51100000
+# 上游 DTS 已经把 ramoops 保留内存划好了，但内核配置里是
+#   # CONFIG_PSTORE is not set
+#   # CONFIG_PSTORE_RAM is not set
+#   # CONFIG_PSTORE_CONSOLE is not set
+# 内存保留了却没人用，崩溃日志被直接丢弃。
+#
+# 【反面教材，别再犯】不能在 .config 里写 CONFIG_KERNEL_PSTORE=y。
+#   实测：把它加进 hk09-full.config 后跑 make defconfig，整行消失
+#   （连 "# ... is not set" 都不留）。因为 config/Config-kernel.in 的
+#   218 个条目里没有 KERNEL_PSTORE，全树 grep 'config KERNEL_PSTORE' 零命中。
+#   能在 .config 里用的只有 Config-kernel.in 白名单里的名字（如 KERNEL_DEVMEM）。
+#
+# 正确做法就是下面这样：直接改 target 的内核 config 文件。
+# 追加而不是覆盖，保留上游原有内容。
+PSTORE_PATCHED=0
+for kcfg in target/linux/qualcommax/config-6.12 \
+            target/linux/qualcommax/ipq807x/config-default; do
+	[ -f "$kcfg" ] || continue
+
+	# 幂等：已经有 CONFIG_PSTORE=y 就不重复加
+	if grep -qxF 'CONFIG_PSTORE=y' "$kcfg"; then
+		log "  $kcfg 里已有 CONFIG_PSTORE=y，跳过"
+		PSTORE_PATCHED=1
+		continue
+	fi
+
+	# 先把可能存在的 "# CONFIG_XXX is not set" 行改成 y，没有就追加。
+	# 直接追加 "CONFIG_X=y" 也是合法的（后者覆盖前者），但显式替换更好读。
+	for sym in PSTORE PSTORE_RAM PSTORE_CONSOLE PSTORE_PMSG PSTORE_COMPRESS; do
+		if grep -qE "^# CONFIG_${sym} is not set$" "$kcfg"; then
+			sed -i "s|^# CONFIG_${sym} is not set$|CONFIG_${sym}=y|" "$kcfg"
+		elif ! grep -qxF "CONFIG_${sym}=y" "$kcfg"; then
+			printf 'CONFIG_%s=y\n' "$sym" >> "$kcfg"
+		fi
+	done
+
+	# PANIC_TIMEOUT：panic 后等 30 秒再重启，给串口留出抓完整栈的时间。
+	# 上游 generic 里是 CONFIG_PANIC_TIMEOUT=1，1 秒根本来不及。
+	if grep -qE '^CONFIG_PANIC_TIMEOUT=' "$kcfg"; then
+		sed -i 's|^CONFIG_PANIC_TIMEOUT=.*|CONFIG_PANIC_TIMEOUT=30|' "$kcfg"
+	else
+		printf 'CONFIG_PANIC_TIMEOUT=30\n' >> "$kcfg"
+	fi
+
+	# PANIC_ON_OOPS：Oops 直接 panic，避免系统带着损坏状态继续跑。
+	if grep -qE '^# CONFIG_PANIC_ON_OOPS is not set$' "$kcfg"; then
+		sed -i 's|^# CONFIG_PANIC_ON_OOPS is not set$|CONFIG_PANIC_ON_OOPS=y|' "$kcfg"
+	elif ! grep -qxF 'CONFIG_PANIC_ON_OOPS=y' "$kcfg"; then
+		printf 'CONFIG_PANIC_ON_OOPS=y\n' >> "$kcfg"
+	fi
+
+	log "  $kcfg: 已开启 pstore/ramoops + panic_on_oops + panic_timeout=30"
+	PSTORE_PATCHED=1
+done
+
+if [ "$PSTORE_PATCHED" = "0" ]; then
+	log "  [警告] 没找到可打补丁的内核 config 文件，pstore 未开启"
+else
+	# 回显最终结果，构建日志里能直接看到
+	for kcfg in target/linux/qualcommax/config-6.12; do
+		[ -f "$kcfg" ] || continue
+		log "  --- $kcfg 中的 pstore/panic 行 ---"
+		grep -E '^CONFIG_(PSTORE|PANIC)' "$kcfg" | sed 's/^/      /' || true
+	done
+fi
+
 # ---------------------------------------------------------------- 0. caldata 补丁
 # 关键：base-files 里的 11-ath11k-caldata 是按 board_name 分支的。
 #
